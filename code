@@ -1,0 +1,1532 @@
+import os, sys, time, warnings, math, random
+warnings.filterwarnings("ignore")
+
+# ──标准库 ─────────────────────────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, f1_score
+from sklearn.svm import SVR
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib
+matplotlib.use("Agg")
+import logging
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# ── 路径配置 ─────────────────────────────────────────────────────────────────
+WIND_CSV = r"D:\life5\其他\非线性\大作业\代码\WIND_CSV.csv"
+JOB_CSV  = r"D:\life5\其他\非线性\大作业\代码\JOB_CSV.csv"
+NODE_CSV = r"D:\life5\其他\非线性\大作业\代码\NODE_CSV.csv"
+OUT_DIR  = "results"
+FIG_DIR  = os.path.join(OUT_DIR, "figures")
+os.makedirs(FIG_DIR, exist_ok=True)
+
+# ── 全局超参 ──────────────────────────────────────────────────────────────────
+SEED         = 42
+WINDOW       = 72          
+HORIZON      = 18          
+STRIDE       = 18
+BATCH        = 128
+EPOCHS       = 30
+LR           = 1e-3
+WD           = 1e-4
+D_MODEL      = 24
+N_HEADS      = 4
+N_LAYERS     = 2
+D_FF         = 96
+NL_DIM       = 3       
+MFDFA_WIN    = 576       
+MFDFA_STRIDE = 96       
+
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] 设备: {DEVICE}")
+
+plt.rcParams.update({
+    "font.family":    ["Microsoft YaHei", "SimHei", "WenQuanYi Zen Hei",
+                       "Noto Sans CJK JP", "DejaVu Sans"],
+    "axes.unicode_minus": False,
+    "figure.dpi":     150,
+    "savefig.dpi":    300,
+    "savefig.bbox":   "tight",
+    "font.size":      9,
+    "axes.labelsize": 9,
+    "axes.titlesize": 9,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8,
+    "lines.linewidth": 1.2,
+})
+W_IN = 9 / 2.54   # 9 cm → inches
+
+
+# 1. 数据加载与预处理# 
+
+def load_wind_power() -> np.ndarray:
+    df = pd.read_csv(WIND_CSV, comment="#", header=0, usecols=[0, 1, 2])
+    df.columns = ["dt", "ws", "pw"]
+    df["pw"] = pd.to_numeric(df["pw"], errors="coerce")
+    df = df.dropna(subset=["pw"]).reset_index(drop=True)
+    pw = np.clip(df["pw"].values.astype(np.float32), 0, None)
+    pw = _wavelet_denoise(pw)
+    pw = _minmax(pw)
+    print(f"  [Wind]  有效点数={len(pw)}, 均值={pw.mean():.3f}, std={pw.std():.3f}")
+    return pw
+
+def load_gpu_load(bin_sec: int = 600) -> np.ndarray:
+    job  = pd.read_csv(JOB_CSV)
+    node = pd.read_csv(NODE_CSV)
+    job  = job.dropna(subset=["submit_time", "duration"]).copy()
+    job["gpu_demand"] = job["gpu_request"].fillna(0) * job["worker_num"].fillna(1)
+    job["end_time"]   = job["submit_time"] + job["duration"]
+
+    t_min = float(job["submit_time"].min())
+    t_max = float(job["end_time"].max())
+    n_bins = int((t_max - t_min) / bin_sec) + 1
+    total_gpu = int(node["gpu_capacity_num"].sum())
+
+    demand = np.zeros(n_bins + 2, dtype=np.float64)
+    s_idx  = np.clip(np.floor((job["submit_time"].values - t_min) / bin_sec).astype(int), 0, n_bins)
+    e_idx  = np.clip(np.floor((job["end_time"].values    - t_min) / bin_sec).astype(int) + 1, 0, n_bins)
+    np.add.at(demand, s_idx,  job["gpu_demand"].values)
+    np.add.at(demand, e_idx, -job["gpu_demand"].values)
+    gpu_ts   = np.cumsum(demand[:n_bins]).astype(np.float32)
+    util_ts  = gpu_ts / (total_gpu + 1e-8)
+
+    # ── 检查点 I/O 阻塞功耗模型 ──
+    llm_jobs = job[
+        job["gpu_model"].isin(["H800", "A100-SXM4-80GB", "A800-SXM4-80GB"]) &
+        (job["job_type"] == "HP") &
+        (job["duration"] > 3600)
+    ].copy()
+    ckpt_ratio    = np.ones(n_bins, dtype=np.float32)
+    ckpt_interval = int(30 * 60 / bin_sec)
+    ckpt_duration = max(1, int(5  * 60 / bin_sec))
+    llm_demand = np.zeros(n_bins + 2, dtype=np.float64)
+    ls = np.clip(np.floor((llm_jobs["submit_time"].values - t_min)/bin_sec).astype(int), 0, n_bins)
+    le = np.clip(np.floor((llm_jobs["end_time"].values    - t_min)/bin_sec).astype(int)+1, 0, n_bins)
+    np.add.at(llm_demand, ls,  llm_jobs["gpu_demand"].values)
+    np.add.at(llm_demand, le, -llm_jobs["gpu_demand"].values)
+    llm_active = np.cumsum(llm_demand[:n_bins]) > 0
+    for t in range(0, n_bins, ckpt_interval):
+        end_t = min(t + ckpt_duration, n_bins)
+        ckpt_ratio[t:end_t] = np.where(llm_active[t:end_t], 0.45, 1.0)
+    gpu_power = util_ts * ckpt_ratio
+
+    # ── Lorenz 混沌扰动──
+    rng   = np.random.default_rng(SEED)
+    chaos = _lorenz_series(n_bins + 2000, rho=28)[:n_bins]
+    chaos = (chaos - chaos.min()) / (chaos.max() - chaos.min() + 1e-8)
+    noise = rng.normal(0, 0.02, n_bins).astype(np.float32)
+    gpu_power = np.clip(gpu_power * (1.0 + 0.08 * chaos + noise), 0, None).astype(np.float32)
+    gpu_power = _wavelet_denoise(gpu_power)
+    gpu_power = _minmax(gpu_power)
+
+    print(f"  [GPU]   作业总数={len(job):,}, LLM训练作业={len(llm_jobs):,}, "
+          f"集群GPU总量={total_gpu}卡")
+    print(f"          时间槽数={n_bins}, 跨度={(t_max-t_min)/86400:.1f}天, "
+          f"均值={gpu_power.mean():.3f}, std={gpu_power.std():.3f}")
+    return gpu_power
+
+
+def align_series(wind: np.ndarray, gpu: np.ndarray):
+    n = min(len(wind), len(gpu))
+    wind, gpu = wind[:n], gpu[:n]
+    net = _minmax(np.clip(gpu - wind + 0.5, 0, 1))
+    print(f"  [Align] 对齐后长度={n} ({n*10/60:.1f}h = {n*10/1440:.1f}天)")
+    return wind[:n], gpu[:n], net[:n]
+
+
+# ── 辅助函数 ─────────────────────────────────────────────────────────────────
+
+def _lorenz_series(n, dt=0.01, sigma=10, rho=28, beta=8/3):
+    x, y, z = 0.1, 0.0, 0.0
+    xs = []
+    for i in range(n + 500):
+        dx = sigma*(y-x); dy = x*(rho-z)-y; dz = x*y-beta*z
+        x += dx*dt; y += dy*dt; z += dz*dt
+        if i >= 500: xs.append(x)
+    return np.array(xs[:n], dtype=np.float32)
+
+def _wavelet_denoise(x):
+    try:
+        import pywt
+        c = pywt.wavedec(x, "db4", level=3)
+        sigma = np.median(np.abs(c[-1])) / 0.6745
+        thr   = sigma * np.sqrt(2 * np.log(len(x)))
+        c2    = [pywt.threshold(ci, thr, mode="soft") for ci in c]
+        return pywt.waverec(c2, "db4")[:len(x)].astype(np.float32)
+    except ImportError:
+        b, a = butter(4, 0.05, btype="low")
+        return filtfilt(b, a, x).astype(np.float32)
+
+def _minmax(x):
+    xmin, xmax = x.min(), x.max()
+    return ((x - xmin) / (xmax - xmin + 1e-8)).astype(np.float32)
+
+def _split(X, y, r=(0.7, 0.1, 0.2)):
+    n = len(X)
+    n1, n2 = int(n*r[0]), int(n*(r[0]+r[1]))
+    return X[:n1], X[n1:n2], X[n2:], y[:n1], y[n1:n2], y[n2:]
+
+def _sliding_window(series, window, horizon, stride):
+    X, y = [], []
+    for i in range(0, len(series)-window-horizon+1, stride):
+        X.append(series[i:i+window])
+        y.append(series[i+window:i+window+horizon])
+    return np.array(X, np.float32), np.array(y, np.float32)
+
+
+# : 相空间重构参数确定      
+
+def _ami(x: np.ndarray, tau: int, n_bins: int = 32) -> float:
+    """
+    计算时间序列 x(t) 与 x(t+τ) 之间的平均互信息量（Average Mutual Information）。
+    用于寻找使 AMI 首次出现局部最小值的延迟 τ，作为最优嵌入延迟。
+    """
+    x = np.asarray(x, dtype=float)
+    y, z = x[:-tau], x[tau:]
+    joint, _, _ = np.histogram2d(y, z, bins=n_bins)
+    px = joint.sum(axis=1); pz = joint.sum(axis=0)
+    px = px / (px.sum() + 1e-12); pz = pz / (pz.sum() + 1e-12)
+    joint = joint / (joint.sum() + 1e-12)
+    outer = np.outer(px, pz)
+    mask  = joint > 0
+    mi    = float((joint[mask] * np.log(joint[mask] / (outer[mask] + 1e-12))).sum())
+    return mi
+
+
+def _fnn(x: np.ndarray, tau: int, max_m: int = 8, rtol: float = 15.0) -> list:
+    N = len(x)
+    fnn_rates = []
+    for m in range(1, max_m + 1):
+        n_pts = N - m * tau
+        if n_pts < 20:
+            fnn_rates.append(0.0)
+            break
+        Y_m  = np.array([x[i : i + m * tau : tau] for i in range(n_pts)])
+        x_next = np.array([x[i + m * tau]           for i in range(n_pts)])
+        nbrs = NearestNeighbors(n_neighbors=2, algorithm="ball_tree").fit(Y_m)
+        dists, idxs = nbrs.kneighbors(Y_m)
+        r_m    = dists[:, 1]     
+        nn_idx = idxs[:, 1]
+        extra  = np.abs(x_next - x_next[nn_idx])  
+        ratio  = extra / (r_m + 1e-10)
+        fnn_rate = float((ratio > rtol).mean())
+        fnn_rates.append(fnn_rate)
+        print(f"    FNN m={m}: 虚假近邻率={fnn_rate:.4f}")
+        if fnn_rate < 0.05:   # < 5% 阈值
+            break
+    return fnn_rates
+
+
+def determine_embedding_params(series: np.ndarray,
+                                max_tau: int = 50,
+                                max_m:   int = 8,
+                                n_bins:  int = 32,
+                                cache_path: str = None):
+
+    if cache_path and os.path.exists(cache_path):
+        d = np.load(cache_path, allow_pickle=True).item()
+        print(f"  [Embedding] 载入缓存: τ_opt={d['tau']}, m_opt={d['m']}")
+        return d["tau"], d["m"], d["ami_vals"], d["fnn_rates"]
+
+    seg = series[:min(3000, len(series))].astype(float)
+
+    # Step 1: AMI → 找首个局部最小值
+    print(f"  [Embedding] 计算 AMI (max_tau={max_tau})...")
+    ami_vals = [_ami(seg, tau, n_bins) for tau in range(1, max_tau + 1)]
+    tau_opt = 1
+    for i in range(1, len(ami_vals) - 1):
+        if ami_vals[i] < ami_vals[i - 1] and ami_vals[i] <= ami_vals[i + 1]:
+            tau_opt = i + 1
+            break
+    print(f"  [Embedding] τ_opt={tau_opt} (AMI 首次局部最小)")
+
+    # Step 2: FNN → 找 FNN 率首次降至 < 5% 的维度
+    print(f"  [Embedding] 计算 FNN (τ={tau_opt}, max_m={max_m})...")
+    fnn_rates = _fnn(seg, tau_opt, max_m=max_m)
+    m_opt = len(fnn_rates)
+    for i, r in enumerate(fnn_rates):
+        if r < 0.05:
+            m_opt = i + 1
+            break
+    print(f"  [Embedding] m_opt={m_opt} (FNN < 5% 虚假近邻)")
+
+    if cache_path:
+        np.save(cache_path, {"tau": tau_opt, "m": m_opt,
+                             "ami_vals": ami_vals, "fnn_rates": fnn_rates})
+    return tau_opt, m_opt, ami_vals, fnn_rates
+
+
+#  2. MF-DFA 
+
+class MFDFA:
+    def __init__(self, q_list=None, poly=2, min_s=30, n_scales=20, ratio=0.25):
+        if q_list is None:
+            q_list = np.concatenate([np.arange(-5, 0, 0.5), np.arange(0.5, 5.5, 0.5)])
+        self.q = np.array(q_list, dtype=float)
+        self.poly = poly; self.min_s = min_s
+        self.n_scales = n_scales; self.ratio = ratio
+
+    def fit(self, x):
+        x = np.asarray(x, float)
+        N = len(x)
+        Y = np.cumsum(x - x.mean())
+        s_max  = max(int(N * self.ratio), self.min_s + 1)
+        scales = np.unique(
+            np.logspace(np.log10(self.min_s), np.log10(s_max),
+                        self.n_scales).astype(int))
+        Fq = np.zeros((len(self.q), len(scales)))
+        for si, s in enumerate(scales):
+            var = self._variances(Y, s)
+            for qi, q in enumerate(self.q):
+                if abs(q) < 1e-8:
+                    Fq[qi, si] = np.exp(0.5 * np.mean(np.log(var + 1e-20)))
+                else:
+                    Fq[qi, si] = np.mean(var ** (q / 2)) ** (1 / q)
+        log_s   = np.log10(scales)
+        hq      = np.array([np.polyfit(log_s, np.log10(Fq[qi] + 1e-20), 1)[0]
+                            for qi in range(len(self.q))])
+        tau     = self.q * hq - 1
+        dq      = self.q[1] - self.q[0] if len(self.q) > 1 else 1.0
+        alpha   = np.gradient(tau, dq)
+        f_alpha = self.q * alpha - tau
+        delta_alpha = float(alpha.max() - alpha.min())
+        alpha0      = float(alpha[np.argmax(f_alpha)])
+        H_mono      = float(hq[np.argmin(np.abs(self.q - 2.0))])
+        return dict(hq=hq, tau=tau, alpha=alpha, f_alpha=f_alpha,
+                    delta_alpha=delta_alpha, alpha0=alpha0, H_mono=H_mono,
+                    scales=scales, Fq=Fq, q_list=self.q)
+
+    def features(self, x):
+        r = self.fit(x)
+        return np.array([r["delta_alpha"], r["alpha0"], r["H_mono"]], np.float32)
+
+    def sliding_delta_alpha(self, x, window, stride):
+        out = []
+        for i in range(0, len(x) - window + 1, stride):
+            try:
+                out.append(self.fit(x[i:i+window])["delta_alpha"])
+            except Exception:
+                out.append(float("nan"))
+        return np.array(out, np.float32)
+
+    def _variances(self, Y, s):
+        N = len(Y); Ns = N // s; t = np.arange(s); vv = []
+        for direction in [1, -1]:
+            Z = Y if direction == 1 else Y[::-1]
+            for v in range(Ns):
+                seg   = Z[v*s:(v+1)*s]
+                trend = np.polyval(np.polyfit(t, seg, self.poly), t)
+                vv.append(max(np.mean((seg - trend) ** 2), 1e-20))
+        return np.array(vv)
+
+
+def build_nl_features(series: np.ndarray, label: str) -> np.ndarray:
+    cache = os.path.join(OUT_DIR, f"nl_{label}.npy")
+    if os.path.exists(cache):
+        print(f"  [MF-DFA] 载入缓存 {cache}")
+        return np.load(cache)
+    print(f"  [MF-DFA] 计算 {label} (窗={MFDFA_WIN}, 步={MFDFA_STRIDE})...")
+    mf    = MFDFA()
+    feats = []
+    positions = list(range(0, len(series) - MFDFA_WIN + 1, MFDFA_STRIDE))
+    for start in tqdm(positions, ncols=70, leave=False):
+        feats.append(mf.features(series[start:start+MFDFA_WIN]))
+    arr = np.array(feats, np.float32)
+    np.save(cache, arr)
+    print(f"  [MF-DFA] 完成 shape={arr.shape}, "
+          f"Δα={arr[:,0].mean():.4f}±{arr[:,0].std():.4f}")
+    return arr
+
+
+#   3.原始网络模型                       
+
+class AdaptiveTemperature(nn.Module):
+       def __init__(self, n_feat=3):
+        super().__init__()
+        self.gamma  = nn.Parameter(torch.tensor(1.0))
+        self.beta   = nn.Parameter(torch.tensor(5.0))
+        self.th_net = nn.Sequential(nn.Linear(n_feat, 16), nn.ReLU(), nn.Linear(16, 1))
+
+    def forward(self, feat):         
+        da = feat[:, 0:1]
+        th = self.th_net(feat)        
+        T  = 1.0 + self.gamma * torch.sigmoid(self.beta * (da - th))
+        return T.unsqueeze(-1)        
+
+
+class AdaptiveMHA(nn.Module):
+    def __init__(self, d, h, drop=0.1):
+        super().__init__()
+        self.h = h; self.dk = d // h
+        self.Wq = nn.Linear(d, d, bias=False); self.Wk = nn.Linear(d, d, bias=False)
+        self.Wv = nn.Linear(d, d, bias=False); self.Wo = nn.Linear(d, d)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, T=None):
+        B, L, _ = x.shape
+        Q = self.Wq(x).view(B, L, self.h, self.dk).transpose(1, 2)
+        K = self.Wk(x).view(B, L, self.h, self.dk).transpose(1, 2)
+        V = self.Wv(x).view(B, L, self.h, self.dk).transpose(1, 2)
+        scale = math.sqrt(self.dk)
+        if T is not None:
+            scale = scale * T.unsqueeze(1)  
+        attn = F.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1)
+        attn = self.drop(attn)
+        out  = (attn @ V).transpose(1, 2).contiguous().view(B, L, -1)
+        return self.Wo(out), attn
+
+
+class TFLayer(nn.Module):
+    def __init__(self, d, h, dff, drop=0.1):
+        super().__init__()
+        self.attn = AdaptiveMHA(d, h, drop)
+        self.ff   = nn.Sequential(nn.Linear(d, dff), nn.GELU(),
+                                   nn.Dropout(drop), nn.Linear(dff, d))
+        self.n1   = nn.LayerNorm(d); self.n2 = nn.LayerNorm(d)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, T=None):
+        a, w = self.attn(x, T)
+        x = self.n1(x + self.drop(a))
+        x = self.n2(x + self.drop(self.ff(x)))
+        return x, w
+
+
+class MFTransformer(nn.Module):
+    def __init__(self, window, horizon, d=D_MODEL, h=N_HEADS,
+                 n_layers=N_LAYERS, dff=D_FF, nl=NL_DIM,
+                 drop=0.1, adaptive=True):
+        super().__init__()
+        self.adaptive = adaptive
+        self.proj   = nn.Linear(1, d)
+        self.pos    = nn.Parameter(torch.randn(1, window, d) * 0.02)
+        self.nl_enc = nn.Sequential(nn.Linear(nl, 32), nn.ReLU(), nn.Linear(32, nl))
+        self.temp   = AdaptiveTemperature(nl) if adaptive else None
+        self.layers = nn.ModuleList([TFLayer(d, h, dff, drop) for _ in range(n_layers)])
+        self.norm   = nn.LayerNorm(d)
+        self.head   = nn.Sequential(nn.Linear(d, dff // 2), nn.GELU(),
+                                     nn.Dropout(drop), nn.Linear(dff // 2, horizon))
+        self._init()
+
+    def _init(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+
+    def forward(self, x, nl=None):
+        if x.dim() == 2: x = x.unsqueeze(-1)
+        h  = self.proj(x) + self.pos
+        T  = None
+        if self.adaptive and nl is not None:
+            T = self.temp(self.nl_enc(nl))
+        aws = []
+        for layer in self.layers:
+            h, aw = layer(h, T)
+            aws.append(aw)
+        h = self.norm(h).mean(dim=1)
+        return self.head(h), aws
+
+
+class LSTMModel(nn.Module):
+    def __init__(self, window, horizon, hidden=128, n_layers=2, drop=0.1):
+        super().__init__()
+        self.lstm = nn.LSTM(1, hidden, n_layers, batch_first=True, dropout=drop)
+        self.head = nn.Linear(hidden, horizon)
+
+    def forward(self, x, nl=None):
+        if x.dim() == 2: x = x.unsqueeze(-1)
+        out, _ = self.lstm(x)
+        return self.head(out[:, -1]), []
+
+
+# ──全局统计量的 sigmoid 归一化 ─────────────────────
+
+class DynPenaltyLoss(nn.Module):
+    def __init__(self, lam: float = 2.0, da_mean: float = 0.0, da_std: float = 1.0):
+        super().__init__()
+        self.lam = lam
+        self.register_buffer("da_mean", torch.tensor(float(da_mean)))
+        self.register_buffer("da_std",  torch.tensor(float(da_std)))
+
+    def forward(self, pred, target, da=None):
+        loss = F.mse_loss(pred, target, reduction="none").mean(-1)
+        if da is not None:
+            da_norm = torch.sigmoid((da - self.da_mean) / (self.da_std + 1e-8))
+            w       = 1.0 + self.lam * da_norm
+            loss    = (w * loss).mean()
+        else:
+            loss = loss.mean()
+        return loss
+
+
+#  4. 训练&验证    
+
+
+def make_loaders(X_tr, X_v, X_te, y_tr, y_v, y_te, nl_tr, nl_v, nl_te):
+    def dl(X, y, nl, shuf):
+        ds = TensorDataset(torch.FloatTensor(X), torch.FloatTensor(y),
+                           torch.FloatTensor(nl))
+        return DataLoader(ds, batch_size=BATCH, shuffle=shuf, num_workers=0)
+    return (dl(X_tr, y_tr, nl_tr, True),
+            dl(X_v,  y_v,  nl_v,  False),
+            dl(X_te, y_te, nl_te, False))
+
+
+def _make_truncated_loader(loader, nl_dim: int, shuffle: bool = False) -> DataLoader:
+    Xs, ys, nls = [], [], []
+    for xb, yb, nl in loader:
+        Xs.append(xb); ys.append(yb); nls.append(nl[:, :nl_dim])
+    ds = TensorDataset(torch.cat(Xs), torch.cat(ys), torch.cat(nls))
+    return DataLoader(ds, batch_size=BATCH, shuffle=shuffle, num_workers=0)
+
+
+def train(model, loaders, name, use_nl=True, da_mean=0.0, da_std=1.0):
+    model = model.to(DEVICE)
+    opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    sch   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+    crit  = DynPenaltyLoss(lam=2.0 if use_nl else 0.0,
+                           da_mean=da_mean, da_std=da_std)
+    tr_lo, val_lo = [], []
+    best_val, best_sd = 1e9, None
+    tr_loader, val_loader, _ = loaders
+    bar = tqdm(range(1, EPOCHS + 1), desc=f"  {name}", ncols=80, leave=True)
+    for ep in bar:
+        model.train(); tl = 0
+        for xb, yb, nl in tr_loader:
+            xb, yb, nl = xb.to(DEVICE), yb.to(DEVICE), nl.to(DEVICE)
+            opt.zero_grad()
+            pred, _ = model(xb, nl if use_nl else None)
+            loss = crit(pred, yb, da=nl[:, 0] if use_nl else None)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); tl += loss.item()
+        sch.step()
+        model.eval(); vl = 0
+        with torch.no_grad():
+            for xb, yb, nl in val_loader:
+                xb, yb, nl = xb.to(DEVICE), yb.to(DEVICE), nl.to(DEVICE)
+                pred, _ = model(xb, nl if use_nl else None)
+                vl += crit(pred, yb).item()
+        tl /= len(tr_loader); vl /= len(val_loader)
+        tr_lo.append(tl); val_lo.append(vl)
+        bar.set_postfix({"train": f"{tl:.5f}", "val": f"{vl:.5f}"})
+        if vl < best_val:
+            best_val = vl
+            best_sd  = {k: v.clone() for k, v in model.state_dict().items()}
+    model.load_state_dict(best_sd)
+    np.save(f"{OUT_DIR}/{name}_tr.npy",  tr_lo)
+    np.save(f"{OUT_DIR}/{name}_val.npy", val_lo)
+    return model, tr_lo, val_lo
+
+
+def evaluate(model, test_loader, use_nl=True, extreme_threshold=None):
+    model.eval()
+    preds, tgts, aws_all, nl_collected = [], [], [], []
+    with torch.no_grad():
+        for xb, yb, nl in test_loader:
+            xb, nl = xb.to(DEVICE), nl.to(DEVICE)
+            pred, aws = model(xb, nl if use_nl else None)
+            preds.append(pred.cpu().numpy())
+            tgts.append(yb.numpy())
+            nl_collected.append(nl.cpu().numpy())
+            if aws:
+                    attn_l0 = aws[0].cpu().numpy()   # shape: (B, H, T, T)
+                for b_i in range(attn_l0.shape[0]):
+                    aws_all.append(attn_l0[b_i, 0])  # head 0
+
+    preds  = np.concatenate(preds)
+    tgts   = np.concatenate(tgts)
+    nl_cat = np.concatenate(nl_collected, axis=0)   # (N_test, NL_DIM)
+
+    flat_p = preds.flatten(); flat_t = tgts.flatten()
+    rmse   = math.sqrt(mean_squared_error(flat_t, flat_p))
+    mae    = mean_absolute_error(flat_t, flat_p)
+    cc     = float(np.corrcoef(flat_t, flat_p)[0, 1])
+
+    if extreme_threshold is not None:
+        t_ext = tgts.max(axis=1)  > extreme_threshold
+        p_ext = preds.max(axis=1) > extreme_threshold
+    else:
+        all_diffs = np.abs(np.diff(tgts,  axis=1)).flatten()
+        thr       = float(np.percentile(all_diffs, 80))
+        t_ext = (np.abs(np.diff(tgts,  axis=1)) > thr).any(1)
+        p_ext = (np.abs(np.diff(preds, axis=1)) > thr).any(1)
+    f1 = f1_score(t_ext, p_ext, zero_division=0)
+
+    return dict(RMSE=rmse, MAE=mae, CC=cc, F1=f1,
+                preds=preds, tgts=tgts,
+                attn_weights=aws_all,   # flat list of (T,T) matrices
+                nl_inputs=nl_cat)       # (N_test, NL_DIM) standardized
+
+
+# ── FIX3: evaluate_svr — 正确的样本外评估 ─────────────────────────────────────
+
+def evaluate_svr(X_tr, y_tr, nl_tr, X_te, y_te, nl_te):
+    feat_tr = np.concatenate([nl_tr, X_tr[:, -24:]], axis=1)
+    feat_te = np.concatenate([nl_te, X_te[:, -24:]], axis=1)
+    tgt_tr  = y_tr[:, 0]
+    tgt_te  = y_te[:, 0]
+    sc = StandardScaler()
+    feat_tr = sc.fit_transform(feat_tr)
+    feat_te = sc.transform(feat_te)     
+    svr = SVR(kernel="rbf", C=10, gamma="scale")
+    svr.fit(feat_tr, tgt_tr)              
+    p_te   = svr.predict(feat_te)     
+    rmse   = math.sqrt(mean_squared_error(tgt_te, p_te))
+    mae    = mean_absolute_error(tgt_te, p_te)
+    cc     = float(np.corrcoef(tgt_te, p_te)[0, 1])
+    return dict(RMSE=rmse, MAE=mae, CC=cc, F1=float("nan"),
+                preds=p_te[:, None], tgts=tgt_te[:, None])
+
+
+# ── 敏感性实验 ────────────────────────────────────────────────────────────────
+
+def sensitivity_smin(series):
+    seg = series[200:200+1024]
+    results = {}
+    for s_min in [10, 20, 30, 50, 80]:
+        mf  = MFDFA(min_s=s_min)
+        das = [mf.fit(seg + 0.02*np.random.randn(len(seg)))["delta_alpha"]
+               for _ in range(40)]
+        results[s_min] = (float(np.mean(das)), float(np.std(das)))
+        print(f"    s_min={s_min:3d}: Δα={results[s_min][0]:.4f}±{results[s_min][1]:.4f}")
+    return results
+
+
+def sensitivity_noise(series):
+    seg = series[200:200+1024]
+    mf  = MFDFA()
+    results = {}
+    for sigma in [0.0, 0.01, 0.05, 0.10, 0.20]:
+        das = [mf.fit(seg + sigma*np.random.randn(len(seg)))["delta_alpha"]
+               for _ in range(30)]
+        results[sigma] = (float(np.mean(das)), float(np.std(das)))
+        print(f"    noise={sigma:.2f}: Δα={results[sigma][0]:.4f}±{results[sigma][1]:.4f}")
+    return results
+
+
+# ──  消融实验 ─────────────────────────────────────────────────────────────
+
+def run_ablation(loaders, window, horizon, da_mean, da_std):
+    tr_loader, val_loader, te_loader = loaders
+    results = {}
+    for nl_dim, tag in [(1, "仅Δα (1维)"), (2, "[Δα,α₀] (2维)"),
+                        (3, "完整[Δα,α₀,Hm] (3维)")]:
+        print(f"\n  ── 消融实验: {tag} ──")
+        ldr = (_make_truncated_loader(tr_loader, nl_dim, shuffle=True),
+               _make_truncated_loader(val_loader, nl_dim, shuffle=False),
+               _make_truncated_loader(te_loader,  nl_dim, shuffle=False))
+        model = MFTransformer(window, horizon, nl=nl_dim, adaptive=True)
+        model, _, _ = train(model, ldr, f"Ablation_{nl_dim}d",
+                           use_nl=True, da_mean=da_mean, da_std=da_std)
+        res = evaluate(model, ldr[2], use_nl=True)
+        results[tag] = res
+        print(f"    RMSE={res['RMSE']:.5f}, CC={res['CC']:.4f}, F1={res['F1']:.4f}")
+    return results
+
+
+#   5.可视化
+def _savefig(name):
+    path = os.path.join(FIG_DIR, name + ".png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close("all")
+    print(f"    已保存: {path}")
+
+
+# ──  Lorenz 系统验证图 ────────────────────────────────────────────────────
+
+def fig_lorenz_validation():
+    mf = MFDFA()
+    rho_vals  = [10, 16, 24, 28, 35, 50, 100]
+    da_list, h_mono_list = [], []
+    print("  [Lorenz验证] 计算不同 ρ 下的 MF-DFA 特征...")
+    for rho in rho_vals:
+        s  = _lorenz_series(4096, rho=rho)
+        s  = _minmax(s)
+        r  = mf.fit(s)
+        da_list.append(r["delta_alpha"])
+        h_mono_list.append(r["H_mono"])
+        print(f"    ρ={rho:4d}: Δα={r['delta_alpha']:.4f}, H_mono={r['H_mono']:.4f}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(W_IN * 1.8, W_IN * 0.78))
+    axes[0].plot(rho_vals, da_list, "o-", color="steelblue", ms=5)
+    axes[0].axvline(28,    color="red",  lw=0.9, ls="--", label="ρ=28 标准混沌")
+    axes[0].axvline(24.74, color="gray", lw=0.8, ls=":",  label="ρ=24.74 混沌阈值")
+    axes[0].set_xlabel("Lorenz 参数 ρ"); axes[0].set_ylabel("多重分形谱宽 Δα")
+    axes[0].set_title("图0a  Δα 随 ρ 的变化（基准验证）")
+    axes[0].legend(fontsize=7); axes[0].grid(alpha=0.3)
+
+    axes[1].plot(rho_vals, h_mono_list, "s-", color="crimson", ms=5)
+    axes[1].axhline(0.5, color="gray", lw=0.8, ls="-.", label="H=0.5 随机游走")
+    axes[1].set_xlabel("Lorenz 参数 ρ"); axes[1].set_ylabel("单分形 Hurst 指数 H_mono")
+    axes[1].set_title("图0b  H_mono 随 ρ 的变化")
+    axes[1].legend(fontsize=7); axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    _savefig("fig0_lorenz_validation")
+
+
+def fig1_mfdfa_spectrum(wind, gpu):
+    mf = MFDFA()
+    noise = np.random.randn(2048).astype(np.float32)
+    r_w = mf.fit(wind[:2048]); r_g = mf.fit(gpu[:2048]); r_n = mf.fit(noise)
+    fig, ax = plt.subplots(figsize=(W_IN, W_IN * 0.78))
+    for r, label, ls, c in [
+        (r_w, "风电功率（Kelmarsh）", "-",  "steelblue"),
+        (r_g, "GPU 负荷（DLRM）",    "--", "crimson"),
+        (r_n, "白噪声基准",          ":",  "gray"),
+    ]:
+        ax.plot(r["alpha"], r["f_alpha"], ls, color=c,
+                label=f"{label}  Δα={r['delta_alpha']:.3f}")
+    ax.set_xlabel("奇异指数 α"); ax.set_ylabel("分形维数 f(α)")
+    ax.set_title("图1  多重分形谱 f(α)−α")
+    ax.legend(); ax.grid(alpha=0.3)
+    _savefig("fig1_mfdfa_spectrum")
+
+
+def fig2_hurst_hq(wind, gpu):
+    mf = MFDFA()
+    r_w = mf.fit(wind[:2048]); r_g = mf.fit(gpu[:2048])
+    fig, ax = plt.subplots(figsize=(W_IN, W_IN * 0.78))
+    ax.plot(r_w["q_list"], r_w["hq"], "-",  color="steelblue", label="风电功率")
+    ax.plot(r_g["q_list"], r_g["hq"], "--", color="crimson",   label="GPU 负荷")
+    ax.axhline(0.5, color="gray", lw=0.8, ls="-.", label="H=0.5（随机游走基准）")
+    ax.set_xlabel("阶数 q"); ax.set_ylabel("广义 Hurst 指数 h(q)")
+    ax.set_title("图2  广义 Hurst 指数 h(q) 曲线")
+    ax.legend(); ax.grid(alpha=0.3)
+    _savefig("fig2_hurst_hq")
+
+
+def fig3_delta_alpha_ts(wind, gpu):
+    mf = MFDFA()
+    n_show = min(4320, len(gpu))
+    g_show = gpu[:n_show]
+    da_ts  = mf.sliding_delta_alpha(g_show, MFDFA_WIN, MFDFA_STRIDE)
+    t_da   = (np.arange(len(da_ts)) * MFDFA_STRIDE + MFDFA_WIN // 2) * 10 / 60
+    t_g    = np.arange(n_show) * 10 / 60
+
+    fig, axes = plt.subplots(3, 1, figsize=(W_IN * 1.3, W_IN * 1.6), sharex=False)
+    axes[0].plot(np.arange(n_show) * 10 / 60, wind[:n_show],
+                 color="steelblue", alpha=0.8, lw=0.8)
+    axes[0].set_ylabel("风电功率\n（归一化）")
+    axes[0].set_title("图3  真实数据时序与 Δα 非线性特征对比")
+    axes[0].grid(alpha=0.3)
+    axes[1].plot(t_g, g_show, color="darkorange", alpha=0.8, lw=0.8)
+    axes[1].set_ylabel("GPU 负荷\n（归一化）"); axes[1].grid(alpha=0.3)
+    th75 = np.nanpercentile(da_ts, 75)
+    axes[2].plot(t_da, da_ts, color="crimson", lw=0.9)
+    axes[2].axhline(th75, color="gray", lw=0.8, ls="--",
+                    label=f"75th 百分位 = {th75:.3f}")
+    axes[2].fill_between(t_da, th75, da_ts, where=da_ts > th75,
+                          alpha=0.3, color="crimson", label="高风险窗口")
+    axes[2].set_xlabel("时间 (h)"); axes[2].set_ylabel("Δα（MF-DFA）")
+    axes[2].legend(fontsize=7); axes[2].grid(alpha=0.3)
+    plt.tight_layout()
+    _savefig("fig3_delta_alpha_ts")
+
+
+def fig4_recurrence_plot(wind, gpu, tau_opt: int):
+    def rp(x, m=3, tau=tau_opt, eps_r=0.12):
+        N = len(x) - (m - 1) * tau
+        Y = np.array([x[i:i+m*tau:tau] for i in range(N)])
+        D = np.sqrt(((Y[:, None] - Y[None, :]) ** 2).sum(-1))
+        return (D <= D.max() * eps_r).astype(float)
+
+    L = 300
+    fig, axes = plt.subplots(1, 2, figsize=(W_IN * 1.4, W_IN * 0.75))
+    for ax, sig, title in zip(axes,
+                               [wind[:L], gpu[:L]],
+                               ["风电功率（Kelmarsh）", "GPU 负荷（DLRM）"]):
+        ax.imshow(rp(sig), cmap="binary", origin="lower")
+        ax.set_xlabel("时间步"); ax.set_ylabel("时间步")
+        ax.set_title(title, fontsize=8)
+    fig.suptitle(f"图6  递归图（Recurrence Plot，m=3, τ={tau_opt}）",
+                 fontsize=9, y=1.01)
+    plt.tight_layout()
+    _savefig("fig4_recurrence_plot")
+
+
+def fig5_phase_space(wind, gpu, tau_opt: int, m_opt: int):
+    from mpl_toolkits.mplot3d import Axes3D
+    tau_vis = tau_opt
+    m_vis   = 3        
+
+    def embed(x):
+        N = len(x) - (m_vis - 1) * tau_vis
+        return np.array([x[i:i+m_vis*tau_vis:tau_vis] for i in range(N)])
+
+    fig = plt.figure(figsize=(W_IN * 1.4, W_IN * 0.75))
+    for idx, (sig, title, cmap) in enumerate([
+        (wind[:2000], "风电功率", "Blues"),
+        (gpu[:2000],  "GPU 负荷", "Reds"),
+    ]):
+        ax = fig.add_subplot(1, 2, idx + 1, projection="3d")
+        Y  = embed(sig)
+        ax.scatter(Y[:, 0], Y[:, 1], Y[:, 2],
+                   c=np.arange(len(Y)), cmap=cmap, s=0.4, alpha=0.5)
+        ax.set_title(title, fontsize=8)
+        ax.set_xlabel("x(t)", fontsize=6); ax.set_ylabel("x(t+τ)", fontsize=6)
+        ax.set_zlabel("x(t+2τ)", fontsize=6); ax.tick_params(labelsize=5)
+    fig.suptitle(
+        f"图7  相空间吸引子（延迟嵌入，m=3 用于三维可视化，τ={tau_vis}由AMI确定；\n"
+        f"模型输入时嵌入维度采用FNN确定的 m_opt={m_opt}）",
+        fontsize=8)
+    plt.tight_layout()
+    _savefig("fig5_phase_space")
+
+
+def fig6_prediction(res_mf, res_b1, res_lstm):
+    n   = 96
+    tgt = res_mf["tgts"][:n].flatten()
+    p_mf = res_mf["preds"][:n].flatten()
+    p_b1 = res_b1["preds"][:n].flatten()
+    p_ls = res_lstm["preds"][:n].flatten()
+    t    = np.arange(len(tgt)) * 10 / 60
+
+    fig, axes = plt.subplots(2, 1, figsize=(W_IN * 1.3, W_IN * 1.2), sharex=True)
+    axes[0].plot(t, tgt,  "k-",  lw=1.0, label="真实值")
+    axes[0].plot(t, p_mf, "r--", lw=0.9, label="MF-Transformer（本文）")
+    axes[0].plot(t, p_b1, "b:",  lw=0.9, label="Base-1 Transformer")
+    axes[0].plot(t, p_ls, "g-.", lw=0.9, label="Base-LSTM")
+    axes[0].set_ylabel("归一化功率"); axes[0].grid(alpha=0.3)
+    axes[0].set_title("图4  多步预测对比（测试集）"); axes[0].legend(fontsize=7)
+    for p, c, lbl in [(p_mf, "red",   "MF-Transformer（本文）"),
+                      (p_b1, "blue",  "Base-1 Transformer"),
+                      (p_ls, "green", "Base-LSTM")]:
+        axes[1].fill_between(t, 0, np.abs(tgt - p), alpha=0.35, color=c, label=lbl)
+    axes[1].set_xlabel("时间 (h)"); axes[1].set_ylabel("绝对误差 |ε|")
+    axes[1].set_title("绝对误差对比"); axes[1].legend(fontsize=7)
+    axes[1].grid(alpha=0.3)
+    plt.tight_layout()
+    _savefig("fig6_prediction_comparison")
+
+
+def fig7_sensitivity(res_smin, res_noise):
+    fig, axes = plt.subplots(1, 2, figsize=(W_IN * 1.5, W_IN * 0.72))
+    s_ks = sorted(res_smin)
+    s_means = [res_smin[k][0] for k in s_ks]
+    s_stds  = [res_smin[k][1] for k in s_ks]
+    axes[0].errorbar(s_ks, s_means, yerr=s_stds, fmt="o-", capsize=4, color="steelblue")
+    axes[0].axvline(30, color="red", lw=0.8, ls="--", label="最优 s_min=30")
+    axes[0].set_xlabel("最小计算窗口 s_min"); axes[0].set_ylabel("Δα 均值 ± 标准差")
+    axes[0].set_title("图5a  s_min 参数敏感性"); axes[0].legend(); axes[0].grid(alpha=0.3)
+    n_ks = sorted(res_noise)
+    n_means = [res_noise[k][0] for k in n_ks]
+    n_stds  = [res_noise[k][1] for k in n_ks]
+    axes[1].errorbar(n_ks, n_means, yerr=n_stds, fmt="s-", capsize=4, color="crimson")
+    axes[1].set_xlabel("噪声强度 σ"); axes[1].set_ylabel("Δα 均值 ± 标准差")
+    axes[1].set_title("图5b  噪声强度敏感性"); axes[1].grid(alpha=0.3)
+    plt.tight_layout()
+    _savefig("fig7_sensitivity")
+
+
+def fig8_attention(res_mf):
+    aws_all   = res_mf.get("attn_weights", [])
+    nl_inputs = res_mf.get("nl_inputs",   None)
+
+    if not aws_all:
+        print("    [fig8] 无注意力权重数据，跳过"); return
+
+    n = min(len(aws_all), len(nl_inputs) if nl_inputs is not None else len(aws_all))
+    da_vals = nl_inputs[:n, 0] if nl_inputs is not None else None
+
+    if da_vals is not None:
+        pct25 = np.percentile(da_vals, 25)
+        pct75 = np.percentile(da_vals, 75)
+        low_mask  = da_vals <= pct25
+        high_mask = da_vals >= pct75
+        low_idxs  = np.where(low_mask)[0]
+        high_idxs = np.where(high_mask)[0]
+
+        if len(low_idxs) > 0 and len(high_idxs) > 0:
+            idx_low   = low_idxs[len(low_idxs) // 2]    # P25 组中位数样本
+            idx_high  = high_idxs[len(high_idxs) // 2]  # P75 组中位数样本
+            low_label  = f"低Δα组（≤P25，Δα={da_vals[idx_low]:.3f}）"
+            high_label = f"高Δα组（≥P75，Δα={da_vals[idx_high]:.3f}）"
+            da_low_mean  = float(da_vals[low_mask].mean())
+            da_high_mean = float(da_vals[high_mask].mean())
+            suptitle = (f"图8  注意力矩阵对比（按真实 Δα 分位数分组）\n"
+                        f"低Δα组均值={da_low_mean:.3f} | 高Δα组均值={da_high_mean:.3f}")
+        else:
+            entropies = [-(a * np.log(a + 1e-10)).sum(-1).mean() for a in aws_all[:n]]
+            idx_low   = int(np.argmin(entropies))
+            idx_high  = int(np.argmax(entropies))
+            low_label  = "低注意力熵（集中型）"; high_label = "高注意力熵（弥散型）"
+            suptitle   = "图8  注意力矩阵对比（按注意力熵分组，回退方案）"
+    else:
+        entropies = [-(a * np.log(a + 1e-10)).sum(-1).mean() for a in aws_all]
+        idx_low   = int(np.argmin(entropies))
+        idx_high  = int(np.argmax(entropies))
+        low_label  = "低注意力熵"; high_label = "高注意力熵"
+        suptitle   = "图8  自适应注意力权重热力图"
+
+    fig, axes = plt.subplots(1, 2, figsize=(W_IN * 1.4, W_IN * 0.75))
+    for ax, idx, title in zip(axes, [idx_low, idx_high], [low_label, high_label]):
+        im = ax.imshow(aws_all[idx], cmap="YlOrRd", aspect="auto")
+        ax.set_xlabel("Key 时间步"); ax.set_ylabel("Query 时间步")
+        ax.set_title(title, fontsize=7.5)
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    fig.suptitle(suptitle, fontsize=8, y=1.04)
+    plt.tight_layout()
+    _savefig("fig8_attention_heatmap")
+
+
+def fig9_training_curves():
+    fig, ax = plt.subplots(figsize=(W_IN, W_IN * 0.78))
+    colors = {"MFTransformer（本文）": "red",
+              "BaseTransformer":       "blue",
+              "Base-LSTM":             "green"}
+    for name, c in colors.items():
+        try:
+            tr  = np.load(f"{OUT_DIR}/{name}_tr.npy")
+            val = np.load(f"{OUT_DIR}/{name}_val.npy")
+            ep  = np.arange(1, len(tr) + 1)
+            ax.plot(ep, tr,  color=c, ls="-",  label=f"{name}-训练集")
+            ax.plot(ep, val, color=c, ls="--", label=f"{name}-验证集")
+        except FileNotFoundError:
+            pass
+    ax.set_xlabel("训练轮次 (Epoch)"); ax.set_ylabel("损失值 (Loss)")
+    ax.set_title("图9  训练与验证损失曲线")
+    ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    _savefig("fig9_training_curves")
+
+
+def fig10_ablation(ablation_results: dict):
+    labels = list(ablation_results.keys())
+    rmse_v = [ablation_results[k]["RMSE"] for k in labels]
+    cc_v   = [ablation_results[k]["CC"]   for k in labels]
+    f1_v   = [ablation_results[k]["F1"]   for k in labels]
+
+    x = np.arange(len(labels))
+    fig, axes = plt.subplots(1, 3, figsize=(W_IN * 2.2, W_IN * 0.80))
+    for ax, vals, ylabel, title, color, better in [
+        (axes[0], rmse_v, "RMSE (↓)",    "RMSE 对比",   "steelblue",  "min"),
+        (axes[1], cc_v,   "CC (↑)",      "CC 对比",     "darkorange", "max"),
+        (axes[2], f1_v,   "F1 极值 (↑)", "F1极值 对比", "crimson",    "max"),
+    ]:
+        bars = ax.bar(x, vals, color=color, alpha=0.8, edgecolor="white")
+        best = min(vals) if better == "min" else max(vals)
+        for bar, v in zip(bars, vals):
+            weight = "bold" if v == best else "normal"
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.0008,
+                    f"{v:.4f}", ha="center", va="bottom",
+                    fontsize=7, fontweight=weight)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=18, ha="right", fontsize=7)
+        ax.set_ylabel(ylabel, fontsize=8); ax.set_title(title, fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+    fig.suptitle("图10  消融实验：NL 特征维度对预测性能的影响", fontsize=9, y=1.04)
+    plt.tight_layout()
+    _savefig("fig10_ablation")
+
+
+#  6.主程序
+
+
+def main():
+    t0 = time.time()
+    print("\n" + "=" * 60)
+    print("  LLM 检查点主动调度")
+    print("=" * 60)
+
+    # ── Step 1: 加载数据 ─────────────────────────────────────────
+    print("\n[1/9] 加载与预处理数据...")
+    wind = load_wind_power()
+    gpu  = load_gpu_load(bin_sec=600)
+    wind, gpu, net = align_series(wind, gpu)
+    target_series = net
+
+    # ── D1/A2: 无Lorenz注入基准────────────────────
+    print("\n  [A2/D1] 无Lorenz注入原始GPU数据MF-DFA基准...")
+    try:
+        gpu_raw, r_raw_gpu = no_lorenz_baseline(JOB_CSV, NODE_CSV)
+        mf_tmp = MFDFA()
+        r_lorenz = mf_tmp.fit(_minmax(gpu[:min(4096, len(gpu))]))
+        print(f"  对比 — 含Lorenz: Δα={r_lorenz['delta_alpha']:.4f} | "
+              f"无Lorenz: Δα={r_raw_gpu['delta_alpha']:.4f}")
+        print(f"  Lorenz注入对Δα的贡献估计: "
+              f"+{(r_lorenz['delta_alpha']-r_raw_gpu['delta_alpha']):.4f} "
+              f"({(r_lorenz['delta_alpha']-r_raw_gpu['delta_alpha'])/r_raw_gpu['delta_alpha']*100:.1f}%)")
+    except Exception as e:
+        print(f"  [跳过] 无法加载原始CSV: {e}")
+
+    # ── C1: 小波去噪影响分析 ─────────────────────────────────────
+    print("\n  [C1] 小波去噪对MF-DFA的影响...")
+    raw_vs_denoised_mfdfa(target_series, label="net")
+
+    # ── Step 2: AMI+FNN 嵌入参数 ─────────────────────────────────
+    print("\n[2/9] 相空间重构参数确定（AMI + FNN）...")
+    emb_cache = os.path.join(OUT_DIR, "embedding_params.npy")
+    tau_opt, m_opt, ami_vals, fnn_rates = determine_embedding_params(
+        target_series, max_tau=50, max_m=8, cache_path=emb_cache)
+
+    # ── Step 3: MF-DFA 特征提取 ──────────────────────────────────
+    print("\n[3/9] MF-DFA 非线性特征提取...")
+    nl_feat = build_nl_features(target_series, "net")
+
+    # ── Step 4: 构建数据集 ───────────────────────────────────────
+    print("\n[4/9] 构建滑窗数据集...")
+    X, y = _sliding_window(target_series, WINDOW, HORIZON, STRIDE)
+    nl_aligned = []
+    for i in range(0, len(target_series) - WINDOW - HORIZON + 1, STRIDE):
+        idx = min((i + WINDOW) // MFDFA_STRIDE, len(nl_feat) - 1)
+        nl_aligned.append(nl_feat[idx])
+    nl_aligned = np.array(nl_aligned, np.float32)
+    n = min(len(X), len(nl_aligned))
+    X, y, nl_aligned = X[:n], y[:n], nl_aligned[:n]
+
+    X_tr, X_v, X_te, y_tr, y_v, y_te = _split(X, y)
+    n1, n2 = int(n * 0.7), int(n * 0.8)
+    nl_tr, nl_v, nl_te = nl_aligned[:n1], nl_aligned[n1:n2], nl_aligned[n2:]
+    sc = StandardScaler()
+    nl_tr = sc.fit_transform(nl_tr).astype(np.float32)
+    nl_v  = sc.transform(nl_v).astype(np.float32)
+    nl_te = sc.transform(nl_te).astype(np.float32)
+    loaders = make_loaders(X_tr, X_v, X_te, y_tr, y_v, y_te, nl_tr, nl_v, nl_te)
+
+    da_mean = float(nl_tr[:, 0].mean())
+    da_std  = float(nl_tr[:, 0].std())
+
+    # B5: 计算物理有意义的极值阈值
+    extreme_thr = compute_extreme_threshold(y_tr, n_std=2.0)
+
+    print(f"  样本总数={n}, train={len(X_tr)}, val={len(X_v)}, test={len(X_te)}")
+    print(f"  极值阈值(mean+2σ)={extreme_thr:.4f}")
+
+    # ── Step 5: 训练主模型 ─────────────────────────────────────────
+    print("\n[5/9] 训练主模型...")
+    mf_model   = MFTransformer(WINDOW, HORIZON, adaptive=True)
+    b1_model   = MFTransformer(WINDOW, HORIZON, adaptive=False)
+    lstm_model = LSTMModel(WINDOW, HORIZON)
+    mf_model,   _, _ = train(mf_model,   loaders, "MFTransformer（本文）",
+                             use_nl=True,  da_mean=da_mean, da_std=da_std)
+    b1_model,   _, _ = train(b1_model,   loaders, "BaseTransformer",
+                             use_nl=False, da_mean=da_mean, da_std=da_std)
+    lstm_model, _, _ = train(lstm_model, loaders, "Base-LSTM",
+                             use_nl=False, da_mean=da_mean, da_std=da_std)
+
+    # ── Step 6: 测试集评估（含新基线）────────────────────────────
+    print("\n[6/9] 测试集评估...")
+    _, _, te_loader = loaders
+    res_mf   = evaluate(mf_model,   te_loader, use_nl=True,
+                        extreme_threshold=extreme_thr)
+    res_b1   = evaluate(b1_model,   te_loader, use_nl=False,
+                        extreme_threshold=extreme_thr)
+    res_lstm = evaluate(lstm_model, te_loader, use_nl=False,
+                        extreme_threshold=extreme_thr)
+    res_svr  = evaluate_svr(X_tr, y_tr, nl_tr, X_te, y_te, nl_te)
+    # B3: 新增朴素基线
+    res_pers = persistence_baseline(X_te, y_te, extreme_thr)
+    res_snas = seasonal_naive_baseline(target_series, X_te, y_te,
+                                        len(X_te), extreme_thr)
+
+    # B1: DM显著性检验
+    dm_mf_b1, p_mf_b1   = diebold_mariano_test(
+        res_mf["preds"], res_b1["preds"],   res_mf["tgts"])
+    dm_mf_lst, p_mf_lst  = diebold_mariano_test(
+        res_mf["preds"], res_lstm["preds"], res_mf["tgts"])
+    dm_mf_per, p_mf_per  = diebold_mariano_test(
+        res_mf["preds"], res_pers["preds"], res_mf["tgts"])
+
+    # ── 打印对比表 ──
+    header = (f"\n{'方法':<26} {'RMSE':>8} {'MAE':>8} {'CC':>7} "
+              f"{'F1_极值':>9} {'DM_p':>8}")
+    sep = "-" * 68
+    print(sep); print(header); print(sep)
+    rows = [
+        ("MFTransformer (本文)",  res_mf,   "—"),
+        ("Base-1 Transformer",   res_b1,   f"{p_mf_b1:.4f}"),
+        ("Base-LSTM",            res_lstm, f"{p_mf_lst:.4f}"),
+        ("Base-2 NL+SVR†",       res_svr,  "—"),
+        ("Persistence Naive",    res_pers, f"{p_mf_per:.4f}"),
+        ("Seasonal Naive(24h)",  res_snas, "—"),
+    ]
+    for name, r, dm_p in rows:
+        f1s = f"{r['F1']:.4f}" if not math.isnan(r["F1"]) else "  —  "
+        print(f"  {name:<24} {r['RMSE']:>8.5f} {r['MAE']:>8.5f} "
+              f"{r['CC']:>7.4f} {f1s:>9} {dm_p:>8}")
+    print(sep)
+    print("  † 样本外评估; DM_p: vs MFTransformer的Diebold-Mariano检验p值")
+
+    # ── Step 7: 消融 & 多seed ────────────────────────────────────
+    print("\n[7/9] 消融实验（NL维度 + 多seed）...")
+    ablation_res = run_ablation(loaders, WINDOW, HORIZON, da_mean, da_std)
+    print("\n  [B1] 多随机种子重复实验（3 seeds）...")
+    ms_summary, res_mf_seeds, res_b1_seeds = multi_seed_eval(
+        loaders, WINDOW, HORIZON, da_mean, da_std, seeds=(42, 123, 456))
+    # 多seed DM检验（seed=42为代表）
+    dm_ms, p_ms = diebold_mariano_test(
+        res_mf_seeds[0]["preds"], res_b1_seeds[0]["preds"],
+        res_mf_seeds[0]["tgts"])
+    print(f"  MFT vs Base-1 (DM): stat={dm_ms:.3f}, p={p_ms:.4f} "
+          f"({'显著' if p_ms<0.05 else '不显著'}差异, α=0.05)")
+
+    # ── Step 8: 窗口长度消融 ────────────────────────────────────
+    print("\n[8/9] 窗口长度消融实验...")
+    win_results = window_size_ablation(target_series, nl_feat, da_mean, da_std)
+
+    # ── A4: 调度决策 ─────────────────────────────────────────────
+    thr_low  = float(np.percentile(y_tr, 25))
+    thr_high = float(np.percentile(y_tr, 75))
+    sched_res = checkpoint_scheduling_rule(res_mf["preds"], thr_low, thr_high)
+
+    # ── 敏感性实验 ──
+    print("\n  敏感性实验1 — s_min:")
+    rs_smin  = sensitivity_smin(target_series)
+    print("\n  敏感性实验2 — 噪声强度:")
+    rs_noise = sensitivity_noise(target_series)
+
+    # ── 保存结果文件 ──
+    with open(f"{OUT_DIR}/metrics.txt", "w", encoding="utf-8") as f:
+        f.write("=== 主模型对比（含新基线）===\n" + header + "\n" + sep + "\n")
+        for name, r, dm_p in rows:
+            f1s = f"{r['F1']:.4f}" if not math.isnan(r["F1"]) else "  —  "
+            f.write(f"  {name:<24} {r['RMSE']:>8.5f} {r['MAE']:>8.5f} "
+                    f"{r['CC']:>7.4f} {f1s:>9} {dm_p:>8}\n")
+        f.write(f"\n=== 多seed均值±std ===\n")
+        for name, d in ms_summary.items():
+            f.write(f"  {name}: RMSE={d['RMSE'][0]:.5f}±{d['RMSE'][1]:.5f}  "
+                    f"CC={d['CC'][0]:.4f}±{d['CC'][1]:.4f}  "
+                    f"F1={d['F1'][0]:.4f}±{d['F1'][1]:.4f}\n")
+        f.write(f"  DM检验(MFT vs B1): stat={dm_ms:.3f}, p={p_ms:.4f}\n")
+        f.write(f"\n=== 消融实验 ===\n")
+        for tag, r in ablation_res.items():
+            f.write(f"  {tag:<26} RMSE={r['RMSE']:.5f} "
+                    f"CC={r['CC']:.4f} F1={r['F1']:.4f}\n")
+        f.write(f"\n=== 窗口消融 ===\n")
+        for lab, r in win_results.items():
+            f.write(f"  WINDOW={lab}: RMSE={r['RMSE']:.5f} "
+                    f"CC={r['CC']:.4f} F1={r['F1']:.4f}\n")
+        f.write(f"\n=== 调度决策统计 ===\n")
+        f.write(f"  立即调度: {sched_res['n_schedule']}次  "
+                f"推迟: {sched_res['n_defer']}次  "
+                f"中性: {sched_res['n_neutral']}次\n")
+        f.write(f"  峰谷差收益: Δload={sched_res['load_shift_benefit']:.4f}\n")
+        f.write(f"\n嵌入参数: τ_opt={tau_opt}, m_opt={m_opt}\n")
+        f.write(f"样本: 总数={n}, train={len(X_tr)}, "
+                f"val={len(X_v)}, test={len(X_te)}\n")
+        f.write(f"极值阈值(mean+2σ)={extreme_thr:.4f}\n")
+
+    # ── Step 9: 生成论文图表 ─────────────────────────────────────
+    print("\n[9/9] 生成论文图表...")
+    fig_lorenz_validation()
+    fig1_mfdfa_spectrum(wind, gpu)
+    fig2_hurst_hq(wind, gpu)
+    fig3_delta_alpha_ts(wind, gpu)
+    fig4_recurrence_plot(wind, gpu, tau_opt)
+    fig5_phase_space(wind, gpu, tau_opt, m_opt)
+    fig6_prediction(res_mf, res_b1, res_lstm)
+    fig7_sensitivity(rs_smin, rs_noise)
+    fig8_attention(res_mf)
+    fig9_training_curves()
+    fig10_ablation(ablation_res)
+    fig11_window_ablation(win_results)
+
+    elapsed = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"  全流程完成！耗时 {elapsed/60:.1f} 分钟")
+    print(f"  输出目录: {os.path.abspath(OUT_DIR)}/")
+    print(f"  τ_opt={tau_opt}, m_opt={m_opt}, "
+          f"test_n={len(X_te)}, extreme_thr={extreme_thr:.4f}")
+    print(f"{'='*60}\n")
+
+
+    # ── Step 1: 加载数据 ─────────────────────────────────────────
+    print("\n[1/7] 加载与预处理数据...")
+    wind = load_wind_power()
+    gpu  = load_gpu_load(bin_sec=600)
+    wind, gpu, net = align_series(wind, gpu)
+    target_series  = net
+
+    # ── Step 2: FIX1 — 互信息法+FNN 确定嵌入参数 ─────────────────
+    print("\n[2/7] 相空间重构参数确定（AMI + FNN）...")
+    emb_cache = os.path.join(OUT_DIR, "embedding_params.npy")
+    tau_opt, m_opt, ami_vals, fnn_rates = determine_embedding_params(
+        target_series, max_tau=50, max_m=8, cache_path=emb_cache)
+    print(f"  最优延迟 τ_opt={tau_opt}, 最优嵌入维度 m_opt={m_opt}")
+
+    # ── Step 3: MF-DFA 特征提取 ──────────────────────────────────
+    print("\n[3/7] MF-DFA 非线性特征提取...")
+    nl_feat = build_nl_features(target_series, "net")
+
+    # ── Step 4: 构建数据集 ───────────────────────────────────────
+    print("\n[4/7] 构建滑窗数据集...")
+    X, y = _sliding_window(target_series, WINDOW, HORIZON, STRIDE)
+    nl_aligned = []
+    for i in range(0, len(target_series) - WINDOW - HORIZON + 1, STRIDE):
+        idx = min((i + WINDOW) // MFDFA_STRIDE, len(nl_feat) - 1)
+        nl_aligned.append(nl_feat[idx])
+    nl_aligned = np.array(nl_aligned, np.float32)
+    n = min(len(X), len(nl_aligned))
+    X, y, nl_aligned = X[:n], y[:n], nl_aligned[:n]
+
+    X_tr, X_v, X_te, y_tr, y_v, y_te = _split(X, y)
+    n1, n2 = int(n * 0.7), int(n * 0.8)
+    nl_tr, nl_v, nl_te = nl_aligned[:n1], nl_aligned[n1:n2], nl_aligned[n2:]
+
+    sc    = StandardScaler()
+    nl_tr = sc.fit_transform(nl_tr).astype(np.float32)
+    nl_v  = sc.transform(nl_v).astype(np.float32)
+    nl_te = sc.transform(nl_te).astype(np.float32)
+
+    loaders = make_loaders(X_tr, X_v, X_te, y_tr, y_v, y_te, nl_tr, nl_v, nl_te)
+    print(f"  样本总数={n}, train={len(X_tr)}, val={len(X_v)}, test={len(X_te)}")
+
+    # FIX2: 计算全局 Δα 统计量供 DynPenaltyLoss 使用
+    da_mean = float(nl_tr[:, 0].mean())
+    da_std  = float(nl_tr[:, 0].std())
+    print(f"  全局 Δα(standardized): mean={da_mean:.4f}, std={da_std:.4f}")
+
+    # ── Step 5: 训练模型 ─────────────────────────────────────────
+    print("\n[5/7] 训练主模型...")
+    mf_model   = MFTransformer(WINDOW, HORIZON, adaptive=True)
+    b1_model   = MFTransformer(WINDOW, HORIZON, adaptive=False)
+    lstm_model = LSTMModel(WINDOW, HORIZON)
+
+    mf_model,   _, _ = train(mf_model,   loaders, "MFTransformer（本文）",
+                             use_nl=True,  da_mean=da_mean, da_std=da_std)
+    b1_model,   _, _ = train(b1_model,   loaders, "BaseTransformer",
+                             use_nl=False, da_mean=da_mean, da_std=da_std)
+    lstm_model, _, _ = train(lstm_model, loaders, "Base-LSTM",
+                             use_nl=False, da_mean=da_mean, da_std=da_std)
+
+    # ── Step 6: 测试集评估 ───────────────────────────────────────
+    print("\n[6/7] 测试集评估...")
+    _, _, te_loader = loaders
+    res_mf   = evaluate(mf_model,   te_loader, use_nl=True)
+    res_b1   = evaluate(b1_model,   te_loader, use_nl=False)
+    res_lstm = evaluate(lstm_model, te_loader, use_nl=False)
+    # FIX3: 正确的样本外 SVR 评估
+    res_svr  = evaluate_svr(X_tr, y_tr, nl_tr, X_te, y_te, nl_te)
+
+    # ── 打印对比表 ──
+    header = f"\n{'方法':<26} {'RMSE':>8} {'MAE':>8} {'CC':>7} {'F1_极值':>9}"
+    sep    = "-" * 62
+    print(sep); print(header); print(sep)
+    rows = [("MFTransformer (本文)",  res_mf),
+            ("Base-1 Transformer",   res_b1),
+            ("Base-LSTM",            res_lstm),
+            ("Base-2 NL+SVR†",       res_svr)]
+    for name, r in rows:
+        f1s = f"{r['F1']:.4f}" if not math.isnan(r["F1"]) else "  —  "
+        print(f"  {name:<24} {r['RMSE']:>8.5f} {r['MAE']:>8.5f} "
+              f"{r['CC']:>7.4f} {f1s:>9}")
+    print(sep)
+    print("† Base-2 NL+SVR: 样本外评估（训练集拟合，测试集预测）")
+
+    # ── 消融实验 ──
+    print("\n[6b/7] 消融实验（NL 特征维度）...")
+    ablation_res = run_ablation(loaders, WINDOW, HORIZON, da_mean, da_std)
+    print(f"\n  {'消融配置':<28} {'RMSE':>8} {'CC':>7} {'F1':>8}")
+    print("  " + "-" * 50)
+    for tag, r in ablation_res.items():
+        print(f"  {tag:<26} {r['RMSE']:>8.5f} {r['CC']:>7.4f} {r['F1']:>8.4f}")
+
+    # ── 写入结果文件 ──
+    with open(f"{OUT_DIR}/metrics.txt", "w", encoding="utf-8") as f:
+        f.write("=== 主模型对比 ===\n" + header + "\n" + sep + "\n")
+        for name, r in rows:
+            f1s = f"{r['F1']:.4f}" if not math.isnan(r["F1"]) else "  —  "
+            f.write(f"  {name:<24} {r['RMSE']:>8.5f} {r['MAE']:>8.5f} "
+                    f"{r['CC']:>7.4f} {f1s:>9}\n")
+        f.write("\n=== 消融实验 ===\n")
+        for tag, r in ablation_res.items():
+            f.write(f"  {tag:<26} RMSE={r['RMSE']:.5f} CC={r['CC']:.4f} "
+                    f"F1={r['F1']:.4f}\n")
+        rmse_imp = (res_b1["RMSE"] - res_mf["RMSE"]) / res_b1["RMSE"] * 100
+        f.write(f"\nMFTransformer vs Base-1: RMSE↓{rmse_imp:.1f}%\n")
+        f.write(f"嵌入参数: τ_opt={tau_opt}, m_opt={m_opt}\n")
+        f.write(f"样本统计: 总数={n}, train={len(X_tr)}, "
+                f"val={len(X_v)}, test={len(X_te)}\n")
+
+    # ── 保存预测结果 ──
+    for name, r in [("mf",   res_mf),   ("b1",   res_b1),
+                    ("lstm", res_lstm)]:
+        np.save(f"{OUT_DIR}/{name}_preds.npy", r["preds"])
+        np.save(f"{OUT_DIR}/{name}_tgts.npy",  r["tgts"])
+
+    # ── 敏感性实验 ──
+    print("\n  敏感性实验1 — s_min 扰动:")
+    rs_smin  = sensitivity_smin(target_series)
+    print("\n  敏感性实验2 — 噪声强度扰动:")
+    rs_noise = sensitivity_noise(target_series)
+
+    # ── Step 7: 生成论文图表 ─────────────────────────────────────
+    print("\n[7/7] 生成论文图表...")
+    fig_lorenz_validation()                           # FIX7: Lorenz 基准验证
+    fig1_mfdfa_spectrum(wind, gpu)
+    fig2_hurst_hq(wind, gpu)
+    fig3_delta_alpha_ts(wind, gpu)
+    fig4_recurrence_plot(wind, gpu, tau_opt)          # FIX6: 使用 tau_opt
+    fig5_phase_space(wind, gpu, tau_opt, m_opt)       # FIX6: 使用 tau_opt/m_opt
+    fig6_prediction(res_mf, res_b1, res_lstm)
+    fig7_sensitivity(rs_smin, rs_noise)
+    fig8_attention(res_mf)                            # FIX5: 按 Δα 分位数分组
+    fig9_training_curves()
+    fig10_ablation(ablation_res)                      # FIX8: 消融结果
+
+    elapsed = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"  全流程完成！耗时 {elapsed/60:.1f} 分钟")
+    print(f"  输出目录: {os.path.abspath(OUT_DIR)}/")
+    print(f"  嵌入参数: τ_opt={tau_opt}, m_opt={m_opt}")
+    print(f"  样本总数: {n}  (train={len(X_tr)}, val={len(X_v)}, test={len(X_te)})")
+    print(f"{'='*60}\n")
+
+
+# ── A2/D1: 无Lorenz注入的原始GPU数据MF-DFA基准 ─────────────────────────────
+
+def no_lorenz_baseline(job_csv, node_csv, bin_sec=600):
+    job  = pd.read_csv(job_csv).dropna(subset=["submit_time","duration"]).copy()
+    node = pd.read_csv(node_csv)
+    job["gpu_demand"] = job["gpu_request"].fillna(0) * job["worker_num"].fillna(1)
+    job["end_time"]   = job["submit_time"] + job["duration"]
+    t_min = float(job["submit_time"].min())
+    t_max = float(job["end_time"].max())
+    n_bins = int((t_max - t_min) / bin_sec) + 1
+    total_gpu = int(node["gpu_capacity_num"].sum())
+
+    demand = np.zeros(n_bins + 2)
+    s_idx  = np.clip(np.floor((job["submit_time"].values - t_min)/bin_sec).astype(int), 0, n_bins)
+    e_idx  = np.clip(np.floor((job["end_time"].values    - t_min)/bin_sec).astype(int)+1, 0, n_bins)
+    np.add.at(demand, s_idx,  job["gpu_demand"].values)
+    np.add.at(demand, e_idx, -job["gpu_demand"].values)
+    gpu_raw = np.cumsum(demand[:n_bins]).astype(np.float32) / (total_gpu + 1e-8)
+
+    gpu_raw = _wavelet_denoise(np.clip(gpu_raw, 0, None))
+    gpu_raw = _minmax(gpu_raw)
+    mf = MFDFA()
+    seg_len = min(4096, len(gpu_raw))
+    r_raw   = mf.fit(gpu_raw[:seg_len])
+    print(f"\n  [无Lorenz基准] Δα={r_raw['delta_alpha']:.4f}, "
+          f"H_mono={r_raw['H_mono']:.4f}")
+    return gpu_raw, r_raw
+
+
+def raw_vs_denoised_mfdfa(series_raw: np.ndarray, label: str = "net"):
+    mf   = MFDFA()
+    seg  = series_raw[:min(4096, len(series_raw))].astype(np.float32)
+    r_raw    = mf.fit(seg)
+    r_denoise= mf.fit(_wavelet_denoise(seg))
+    print(f"\n  [去噪影响 - {label}]")
+    print(f"    原始:   Δα={r_raw['delta_alpha']:.4f}, H_mono={r_raw['H_mono']:.4f}")
+    print(f"    去噪后: Δα={r_denoise['delta_alpha']:.4f}, H_mono={r_denoise['H_mono']:.4f}")
+    delta_da = abs(r_denoise['delta_alpha'] - r_raw['delta_alpha'])
+    print(f"    Δα偏置: {delta_da:.4f} ({delta_da/r_raw['delta_alpha']*100:.1f}%)")
+
+    fig, axes = plt.subplots(1, 2, figsize=(W_IN * 1.6, W_IN * 0.75))
+    for ax, r, title, c in [
+        (axes[0], r_raw,    f"去噪前 Δα={r_raw['delta_alpha']:.3f}",    "steelblue"),
+        (axes[1], r_denoise, f"去噪后 Δα={r_denoise['delta_alpha']:.3f}", "crimson"),
+    ]:
+        ax.plot(r["alpha"], r["f_alpha"], "-", color=c)
+        ax.set_xlabel("奇异指数 α"); ax.set_ylabel("f(α)")
+        ax.set_title(title, fontsize=8); ax.grid(alpha=0.3)
+    fig.suptitle(f"附图  小波去噪前后多重分形谱对比（{label}序列）", fontsize=9)
+    plt.tight_layout()
+    _savefig(f"fig_appendix_denoise_{label}")
+    return r_raw, r_denoise
+
+
+# ── B1：预测差异显著性检验 ──────────────────────────────────
+
+def diebold_mariano_test(pred_a: np.ndarray,
+                         pred_b: np.ndarray,
+                         actual: np.ndarray,
+                         loss_fn: str = "mse") -> tuple:
+    from scipy import stats as sp_stats
+    e_a = pred_a.flatten() - actual.flatten()
+    e_b = pred_b.flatten() - actual.flatten()
+    d   = (e_a**2 - e_b**2) if loss_fn == "mse" else (np.abs(e_a) - np.abs(e_b))
+    n   = len(d)
+    d_bar = float(d.mean())
+    autocov = float(np.cov(d[1:], d[:-1])[0, 1]) if n > 2 else 0.0
+    var_d   = max((float(np.var(d, ddof=1)) + 2 * autocov) / n, 1e-12)
+    dm_stat = d_bar / math.sqrt(var_d)
+    p_value = float(2 * sp_stats.t.sf(abs(dm_stat), df=n - 1))
+    return dm_stat, p_value
+
+
+def multi_seed_eval(loaders, window, horizon, da_mean, da_std,
+                    seeds=(42, 123, 456)):
+    print(f"\n  [多seed实验] seeds={list(seeds)}")
+    res_mf_all, res_b1_all = [], []
+    _, _, te_loader = loaders
+    for seed in seeds:
+        torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
+        mf = MFTransformer(window, horizon, adaptive=True)
+        b1 = MFTransformer(window, horizon, adaptive=False)
+        mf, _, _ = train(mf, loaders, f"MF_s{seed}", use_nl=True,
+                        da_mean=da_mean, da_std=da_std)
+        b1, _, _ = train(b1, loaders, f"B1_s{seed}", use_nl=False)
+        res_mf_all.append(evaluate(mf, te_loader, use_nl=True))
+        res_b1_all.append(evaluate(b1, te_loader, use_nl=False))
+        print(f"    seed={seed}: MF RMSE={res_mf_all[-1]['RMSE']:.5f}, "
+              f"B1 RMSE={res_b1_all[-1]['RMSE']:.5f}")
+
+    summary = {}
+    for name, res_list in [("MFTransformer", res_mf_all), ("Base-1", res_b1_all)]:
+        summary[name] = {}
+        for m in ["RMSE", "MAE", "CC", "F1"]:
+            vals = [r[m] for r in res_list]
+            summary[name][m] = (float(np.mean(vals)), float(np.std(vals)))
+        print(f"    {name}: RMSE={summary[name]['RMSE'][0]:.5f}"
+              f"±{summary[name]['RMSE'][1]:.5f}")
+    return summary, res_mf_all, res_b1_all
+
+
+
+def persistence_baseline(X_te: np.ndarray, y_te: np.ndarray,
+                          extreme_thr: float) -> dict:
+    preds = np.repeat(X_te[:, -1:], HORIZON, axis=1)
+    flat_p, flat_t = preds.flatten(), y_te.flatten()
+    rmse = math.sqrt(mean_squared_error(flat_t, flat_p))
+    mae  = mean_absolute_error(flat_t, flat_p)
+    cc   = float(np.corrcoef(flat_t, flat_p)[0, 1])
+    t_ext = y_te.max(axis=1)  > extreme_thr
+    p_ext = preds.max(axis=1) > extreme_thr
+    f1    = f1_score(t_ext, p_ext, zero_division=0)
+    return dict(RMSE=rmse, MAE=mae, CC=cc, F1=f1, preds=preds, tgts=y_te)
+
+
+def seasonal_naive_baseline(target_series: np.ndarray,
+                             X_te: np.ndarray, y_te: np.ndarray,
+                             n_test: int, extreme_thr: float,
+                             season_steps: int = 144) -> dict:
+
+    n_total = len(target_series)
+    n_tr    = n_total - n_test
+    preds   = []
+    for i in range(n_test):
+        start_in_series = n_tr + i * STRIDE
+        pred_start = start_in_series + WINDOW 
+        ref_start = max(pred_start - season_steps, 0)
+        ref_end   = ref_start + HORIZON
+        if ref_end <= n_total:
+            preds.append(target_series[ref_start:ref_end])
+        else:
+            preds.append(np.repeat(target_series[-1], HORIZON))
+    preds = np.array(preds, dtype=np.float32)
+    if len(preds) < len(y_te):
+        y_te = y_te[:len(preds)]
+    flat_p, flat_t = preds.flatten(), y_te.flatten()
+    rmse = math.sqrt(mean_squared_error(flat_t, flat_p))
+    mae  = mean_absolute_error(flat_t, flat_p)
+    cc   = float(np.corrcoef(flat_t, flat_p)[0, 1])
+    t_ext = y_te.max(axis=1)  > extreme_thr
+    p_ext = preds.max(axis=1) > extreme_thr
+    f1    = f1_score(t_ext, p_ext, zero_division=0)
+    return dict(RMSE=rmse, MAE=mae, CC=cc, F1=f1, preds=preds, tgts=y_te)
+
+
+# ──窗口长度消融实验 ─────────────────────────────────────────────────────
+
+def window_size_ablation(target_series: np.ndarray,
+                         nl_feat: np.ndarray,
+                         da_mean: float, da_std: float):
+    results = {}
+    for win, label in [(36, "6h"), (72, "12h(默认)"), (144, "24h"), (288, "48h")]:
+        print(f"\n  ── 窗口消融: WINDOW={win}步 ({label}) ──")
+        X, y = _sliding_window(target_series, win, HORIZON, STRIDE)
+        nl_a = []
+        for i in range(0, len(target_series) - win - HORIZON + 1, STRIDE):
+            idx = min((i + win) // MFDFA_STRIDE, len(nl_feat) - 1)
+            nl_a.append(nl_feat[idx])
+        nl_a = np.array(nl_a, np.float32)
+        n = min(len(X), len(nl_a))
+        X, y, nl_a = X[:n], y[:n], nl_a[:n]
+        X_tr, X_v, X_te, y_tr, y_v, y_te = _split(X, y)
+        n1, n2 = int(n * .7), int(n * .8)
+        nl_tr, nl_v, nl_te = nl_a[:n1], nl_a[n1:n2], nl_a[n2:]
+        sc = StandardScaler()
+        nl_tr = sc.fit_transform(nl_tr).astype(np.float32)
+        nl_v  = sc.transform(nl_v).astype(np.float32)
+        nl_te = sc.transform(nl_te).astype(np.float32)
+        loaders = make_loaders(X_tr, X_v, X_te, y_tr, y_v, y_te, nl_tr, nl_v, nl_te)
+        model = MFTransformer(win, HORIZON, adaptive=True)
+        model, _, _ = train(model, loaders, f"Win{win}",
+                           use_nl=True, da_mean=da_mean, da_std=da_std)
+        _, _, te_l = loaders
+        ethr = float(y_tr.mean() + 2 * y_tr.std())
+        res  = evaluate(model, te_l, use_nl=True, extreme_threshold=ethr)
+        results[label] = res
+        print(f"    RMSE={res['RMSE']:.5f}, CC={res['CC']:.4f}, F1={res['F1']:.4f}")
+    return results
+
+
+def fig11_window_ablation(results: dict):
+    labels = list(results.keys())
+    rmse_v = [results[k]["RMSE"] for k in labels]
+    cc_v   = [results[k]["CC"]   for k in labels]
+    x = np.arange(len(labels))
+    fig, axes = plt.subplots(1, 2, figsize=(W_IN * 1.5, W_IN * 0.72))
+    for ax, vals, ylabel, color in [
+        (axes[0], rmse_v, "RMSE (↓)", "steelblue"),
+        (axes[1], cc_v,   "CC (↑)",   "darkorange"),
+    ]:
+        bars = ax.bar(x, vals, color=color, alpha=0.8, edgecolor="white")
+        best = (min(vals) if ylabel.endswith("↓)") else max(vals))
+        for bar, v in zip(bars, vals):
+            w = "bold" if abs(v - best) < 1e-6 else "normal"
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.0005, f"{v:.4f}",
+                    ha="center", va="bottom", fontsize=7, fontweight=w)
+        ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8); ax.grid(axis="y", alpha=0.3)
+    fig.suptitle("图11  预测窗口长度消融实验（HORIZON=3h固定）",
+                 fontsize=9, y=1.02)
+    plt.tight_layout()
+    _savefig("fig11_window_ablation")
+
+
+# ── 基于预测的检查点调度决策规则 ───────────────────────────────────────────
+
+def checkpoint_scheduling_rule(pred_net_load: np.ndarray,
+                                 thr_low:  float,
+                                 thr_high: float) -> dict:
+    max_pred  = pred_net_load.max(axis=1)
+    decisions = np.where(max_pred < thr_low,  "SCHEDULE",
+                np.where(max_pred > thr_high, "DEFER", "NEUTRAL"))
+    n_sch  = (decisions == "SCHEDULE").sum()
+    n_def  = (decisions == "DEFER").sum()
+    n_neu  = (decisions == "NEUTRAL").sum()
+    sch_mask = decisions == "SCHEDULE"
+    def_mask = decisions == "DEFER"
+    avg_sch = float(pred_net_load[sch_mask].mean()) if sch_mask.any() else thr_low
+    avg_def = float(pred_net_load[def_mask].mean()) if def_mask.any() else thr_high
+    load_shift_benefit = avg_def - avg_sch        # 节省的功率（归一化）
+    print(f"\n  [调度决策规则] 阈值: low={thr_low:.3f}, high={thr_high:.3f}")
+    print(f"    立即调度: {n_sch}次 ({n_sch/len(decisions)*100:.1f}%)")
+    print(f"    推迟:     {n_def}次 ({n_def/len(decisions)*100:.1f}%)")
+    print(f"    中性:     {n_neu}次 ({n_neu/len(decisions)*100:.1f}%)")
+    print(f"    峰谷差收益: Δload={load_shift_benefit:.4f}（归一化功率单位）")
+    return dict(decisions=decisions, n_schedule=int(n_sch),
+                n_defer=int(n_def), n_neutral=int(n_neu),
+                load_shift_benefit=load_shift_benefit,
+                avg_load_schedule=avg_sch, avg_load_defer=avg_def)
+
+
+# ── 极值事件F1计算 ─────────────────────────────────────────────
+
+def compute_extreme_threshold(y_train: np.ndarray, n_std: float = 2.0) -> float:
+    thr = float(y_train.mean() + n_std * y_train.std())
+    pos_rate = float((y_train.max(axis=1) > thr).mean())
+    print(f"  [极值阈值] mean+{n_std}σ = {thr:.4f}, "
+          f"训练集正样本率={pos_rate*100:.1f}%")
+    return thr
+if __name__ == "__main__":
+    main()
