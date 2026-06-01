@@ -9,6 +9,6 @@ Analysis of Load Data from Data Centers and Wind Farms
 （可以在pycharm环境中运行，如未安装各类运行包。可以在pycharm调试框里进行下载，有install package的字样）
  
 输出目录: results
-1.figures/        论文图表
+1.figures        论文图表
 2.metrics.txt     定量结果对比表，含消融实验
 3.*.npy           中间数据缓存
