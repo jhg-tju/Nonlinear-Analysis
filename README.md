@@ -5,7 +5,7 @@ Analysis of Load Data from Data Centers and Wind Farms
 2. 阿里 DLRM 算力任务调度 Trace (instance 级时间戳, 秒)
  
 运行方法:
-pip install numpy pandas scipy scikit-learn torch matplotlib pywavelets tqdmpython pipeline_fixed.py
+1.pip install numpy pandas scipy scikit-learn torch matplotlib pywavelets tqdmpython 2.pipeline_fixed.py
 （可以在pycharm环境中运行，如未安装各类运行包。可以在pycharm调试框里进行下载，有install package的字样）
  
 输出目录: results
