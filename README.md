@@ -8,7 +8,7 @@ Analysis of Load Data from Data Centers and Wind Farms
 运行方法:  
 1.pip install numpy、pandas、scipy、scikit-learn、torch、matplotlib、pywavelets、tqdmpython  
 2.code.py（可以在pycharm环境中运行，如未安装各类运行包，可以在pycharm调试框里进行下载，有install package的字样）  
-3.将代码中  
+3.将代码中24-26行代码中  
 WIND_CSV = r"D:\life5\其他\非线性\大作业\代码\WIND_CSV.csv"  
 JOB_CSV  = r"D:\life5\其他\非线性\大作业\代码\JOB_CSV.csv"  
 NODE_CSV = r"D:\life5\其他\非线性\大作业\代码\NODE_CSV.csv"  
