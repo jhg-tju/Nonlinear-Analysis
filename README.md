@@ -1,8 +1,8 @@
 # Nonlinear-Analysis
 Analysis of Load Data from Data Centers and Wind Farms
 
-数据集:1. Kelmarsh 风机功率数据  (10 min 间隔, 2016-01-03 ~ 2017-01-01)
-2. 阿里 DLRM 算力任务调度 Trace (instance 级时间戳, 秒)
+数据集:1. Kelmarsh 风机功率数据 WINN_CVS.cvs (10 min 间隔, 2016-01-03 ~ 2017-01-01)
+2. 阿里 DLRM 算力任务调度 Trace JOB_CVS.cvs和NODE_CVS.cvs (instance 级时间戳, 秒)
  
 运行方法:
 1.pip install numpy pandas scipy scikit-learn torch matplotlib pywavelets tqdmpython 2.code.py
